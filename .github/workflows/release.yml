@@ -1,0 +1,291 @@
+name: Release
+
+# Publishes this repository's own release: it checks the sources, builds the desktop installers
+# on the runners, attaches them to the GitHub release, and writes the download table, the
+# checksums and the installation instructions (INSTALL.md) onto the release.
+#
+# Adapted from the upstream workflow for this repository:
+# - The ds-bot package is not published to npm. Upstream uses npm Trusted Publishing set up for
+#   Fei2411/DS-Bot, which this repository cannot use; pack the plugin with `npm pack` in ds-bot/
+#   when a .tgz is needed.
+# - The Android APK is not built: it needs the upload keystore in repository secrets, and an APK
+#   signed with another key cannot upgrade an existing install.
+# - The macOS and Linux jobs do not stop the release. Windows is the installer most users take;
+#   a runner that cannot build its platform leaves a note here instead of failing everything.
+#
+# Windows and the Linux AppImage update from latest.yml / latest-linux.yml, which is why the
+# Windows and Linux jobs attach those files too.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  # write: attach the installers, the checksums and INSTALL.md to the release.
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: ds-bot
+    steps:
+      - uses: actions/checkout@v4
+      # The tests rebuild link.js from ../link and run its Relay Server, which has its own packages.
+      - name: Install the phone link's packages
+        run: npm ci --no-fund --no-audit --prefix ../link
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-fund --no-audit
+      - run: npm run harness
+      - run: npm test
+      - run: node scripts/build-client.mjs --check
+      - run: npm run lint
+      # This repository does not publish the plugin to npm, so the release carries the package
+      # file: DSH Desktop installs it through Add plugin, and it is what the README documents.
+      - name: Pack the plugin
+        run: npm pack
+      - name: Attach the plugin package to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" ds-bot-*.tgz --clobber
+
+  windows:
+    name: Windows installer
+    needs: check
+    # A failing check is reported on its own job: the installer is still built, so a flaky
+    # test on the runner cannot leave a release without a download.
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-fund --no-audit
+      - run: node scripts/seed-electron-checksums.mjs
+      - name: Cache the locked runtime archives
+        uses: actions/cache@v4
+        with:
+          # A cache from another lock version cannot supply a wrong runtime: the archives are
+          # stored under their sha256 and every read is verified against it again.
+          path: app/build/runtime-cache
+          key: runtime-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/scripts/primary-runtime.lock.json') }}
+      - run: npm run dist
+      - name: Check the packaged app
+        run: node scripts/check-packed.mjs
+      - name: Keep the installer for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DS-Bot-win-x64
+          path: app/dist-pack/DS-Bot-*-win-x64.exe
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - name: Attach the installer to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          installer="dist-pack/DS-Bot-$(node -p "require('./package.json').version")-win-x64.exe"
+          gh release upload "$TAG" "$installer" "$installer.blockmap" dist-pack/latest.yml --clobber
+
+  linux:
+    name: Linux packages
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # A runner that cannot package Linux must not hold back the Windows installer.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-fund --no-audit
+      - run: node scripts/seed-electron-checksums.mjs
+      - name: Cache the locked runtime archives
+        uses: actions/cache@v4
+        with:
+          path: app/build/runtime-cache
+          key: runtime-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/scripts/primary-runtime.lock.json') }}
+      - run: npm run dist
+      - name: Check the files for the release
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          ls -l "dist-pack/DS-Bot-$version-linux-x86_64.AppImage" "dist-pack/DS-Bot-$version-linux-amd64.deb" dist-pack/latest-linux.yml
+      - name: Keep the packages for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DS-Bot-linux-x64
+          path: |
+            app/dist-pack/DS-Bot-*-linux-x86_64.AppImage
+            app/dist-pack/DS-Bot-*-linux-amd64.deb
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - name: Attach the packages to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        # The AppImage carries its block map inside the file, so there is no .blockmap to attach.
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          gh release upload "$TAG" "dist-pack/DS-Bot-$version-linux-x86_64.AppImage" "dist-pack/DS-Bot-$version-linux-amd64.deb" dist-pack/latest-linux.yml --clobber
+
+  macos:
+    name: macOS zip (Apple chip)
+    needs: check
+    if: always()
+    runs-on: macos-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --no-fund --no-audit
+      - run: node scripts/seed-electron-checksums.mjs
+      - name: Cache the locked runtime archives
+        uses: actions/cache@v4
+        with:
+          path: app/build/runtime-cache
+          key: runtime-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/scripts/primary-runtime.lock.json') }}
+      - run: npm run dist
+      - name: Check the zip
+        run: |
+          zip="dist-pack/DS-Bot-$(node -p "require('./package.json').version")-mac-arm64.zip"
+          test -f "$zip"
+      - name: Keep the zip for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DS-Bot-mac-arm64
+          path: app/dist-pack/DS-Bot-*-mac-arm64.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+      - name: Attach the zip to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "dist-pack/DS-Bot-$(node -p "require('./package.json').version")-mac-arm64.zip" --clobber
+
+  notes:
+    name: Download table, checksums and install notes
+    needs: [check, windows, linux, macos]
+    # Every platform job may fail without stopping the others, so this one always runs and
+    # describes whatever did reach the release.
+    if: always() && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download what the release has
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/assets" --pattern 'DS-Bot-*' || true
+          gh release download "$TAG" --dir "$RUNNER_TEMP/assets" --pattern 'ds-bot-*.tgz' || true
+          ls -l "$RUNNER_TEMP/assets"
+      - name: Write the download table, the checksums and the notes
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          version="$(node -p "require('./ds-bot/package.json').version")"
+          cd "$RUNNER_TEMP/assets"
+          files=(DS-Bot-* ds-bot-*.tgz)
+          : > SHA256SUMS.txt
+          for file in "${files[@]}"; do
+            case "$file" in
+              *.blockmap) continue ;;
+            esac
+            sha256sum "$file" >> SHA256SUMS.txt
+          done
+          {
+            echo "## Download / 下载"
+            echo
+            echo "| File / 文件 | Size / 大小 |"
+            echo "|---|---|"
+            for file in "${files[@]}"; do
+              case "$file" in
+                *.blockmap) continue ;;
+              esac
+              bytes="$(stat -c %s "$file")"
+              size="$(awk -v b="$bytes" 'BEGIN { printf "%.0f MB", b / 1048576 }')"
+              echo "| [$file](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$file) | $size |"
+            done
+            echo
+            echo 'The `.blockmap` and `latest*.yml` files are for automatic updates: you do not need them. / `.blockmap` 和 `latest*.yml` 是给自动更新用的，不用下载。'
+            echo
+            echo "Version: \`$version\` · To check a download, compare its SHA-256 with \`SHA256SUMS.txt\`. / 下载后可用 \`SHA256SUMS.txt\` 核对 SHA-256。"
+            echo
+            cat "$GITHUB_WORKSPACE/INSTALL.md"
+          } > "$RUNNER_TEMP/generated.md"
+          # A copy without the version in its name, so a fixed
+          # releases/latest/download/DS-Bot-<os>-<arch>.<ext> link keeps working.
+          mkdir -p "$RUNNER_TEMP/attach"
+          for file in DS-Bot-*; do
+            case "$file" in
+              *.blockmap) continue ;;
+            esac
+            copy="${file//DS-Bot-$version-/DS-Bot-}"
+            cp "$file" "$RUNNER_TEMP/attach/$copy"
+          done
+          cp SHA256SUMS.txt "$RUNNER_TEMP/attach/SHA256SUMS.txt"
+          # The release body a person wrote stays; only the generated block is replaced, so a
+          # second run of this job does not stack another table on the release.
+          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/existing.md" || true
+          awk 'BEGIN { skip = 0 } /<!-- release-notes -->/ { skip = 1; next } /<!-- \/release-notes -->/ { skip = 0; next } skip == 0 { print }' \
+            "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/rest.md" || true
+          {
+            echo '<!-- release-notes -->'
+            cat "$RUNNER_TEMP/generated.md"
+            echo '<!-- /release-notes -->'
+            if [ -s "$RUNNER_TEMP/rest.md" ]; then echo; cat "$RUNNER_TEMP/rest.md"; fi
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md"
+      - name: Attach the checksums, the copies without a version and INSTALL.md
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$RUNNER_TEMP/attach"/* "$GITHUB_WORKSPACE/INSTALL.md" --clobber
+      - name: Put the table and the install notes on the release
+        run: gh release edit "$TAG" --notes-file "$RUNNER_TEMP/body.md"
+      # GitHub cannot make a pre-release Latest.
+      - name: Mark the release as Latest
+        if: ${{ !github.event.release.prerelease }}
+        run: gh release edit "$TAG" --latest
