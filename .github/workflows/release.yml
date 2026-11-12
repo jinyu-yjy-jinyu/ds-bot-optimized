@@ -267,16 +267,12 @@ jobs:
             cp "$file" "$RUNNER_TEMP/attach/$copy"
           done
           cp SHA256SUMS.txt "$RUNNER_TEMP/attach/SHA256SUMS.txt"
-          # The release body a person wrote stays; only the generated block is replaced, so a
-          # second run of this job does not stack another table on the release.
-          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/existing.md" || true
-          awk 'BEGIN { skip = 0 } /<!-- release-notes -->/ { skip = 1; next } /<!-- \/release-notes -->/ { skip = 0; next } skip == 0 { print }' \
-            "$RUNNER_TEMP/existing.md" > "$RUNNER_TEMP/rest.md" || true
+          # The notes come from the files in the tag, never from the body the release already has:
+          # a run that reads its own last answer back is a run that can lose it.
           {
-            echo '<!-- release-notes -->'
             cat "$RUNNER_TEMP/generated.md"
-            echo '<!-- /release-notes -->'
-            if [ -s "$RUNNER_TEMP/rest.md" ]; then echo; cat "$RUNNER_TEMP/rest.md"; fi
+            echo
+            cat "$GITHUB_WORKSPACE/RELEASE_NOTES.md"
           } > "$RUNNER_TEMP/body.md"
           cat "$RUNNER_TEMP/body.md"
       - name: Attach the checksums, the copies without a version and INSTALL.md
